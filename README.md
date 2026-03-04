@@ -1,3 +1,179 @@
-# RL ISS Docking Simulator
+# rl-iss-docking-simulator
 
-ISS Docking Simulator for RL
+A Dragon spacecraft ISS docking autonomous driving system built with a custom
+[Gymnasium](https://gymnasium.farama.org/) environment and trained with
+[Stable-Baselines3](https://stable-baselines3.readthedocs.io/) SAC.
+
+The agent connects to the real [SpaceX ISS Docking Simulator](https://iss-sim.spacex.com/)
+running in a Chrome browser, reads state data from the page DOM, and clicks
+the control buttons to manoeuvre the Dragon spacecraft to a successful soft dock.
+
+## Overview
+
+The SpaceX ISS Docking Simulator presents a browser-based interface that
+familiarises users with the controls used by NASA astronauts.  Successful
+docking requires all six error readings (position offsets x/y/z and attitude
+errors roll/pitch/yaw), the approach rate, and the range to all fall below 0.2.
+
+### Environment
+
+| Property | Value |
+|---|---|
+| Observation space | 8-D continuous — x, y, z (m), roll (°), range (m), yaw (°), rate (m/s), pitch (°) |
+| Action space | Continuous Box(6) — `[tx, ty, tz, roll, pitch, yaw]` in `[-1,1]` |
+| Step delay | 0.5 s (wait for physics to settle after each button press) |
+| Max episode length | 3 000 steps |
+
+**Actions**
+
+The policy outputs a continuous 6-D command vector. The environment maps the
+dominant component to one simulator thruster button click (with deadzone and
+adaptive control authority to reduce over-control in high-inertia dynamics).
+
+**Episode termination conditions**
+
+- ✅ **Success** — all readings (x, y, z, roll, range, yaw, rate, pitch) < 0.2
+- 💥 **Collision** — approach rate < −0.2 m/s when within 5 m of the ISS
+- ⏱ **Timeout** — 3 000 steps elapsed
+
+**Reward shaping**
+
+- `+100` for a successful docking
+- `−50` for a collision
+- `+ (previous_error − current_error)` progress reward each step
+- `−0.01` per-step time penalty
+
+### Algorithm
+
+Soft Actor-Critic (**SAC**) from Stable-Baselines3 with an MLP policy.  Only
+one simulator instance runs at a time, so training is strictly sequential.
+
+## Project Structure
+
+```
+.
+├── docking/
+│   ├── __init__.py      # Package — exports IssDockingEnv
+│   ├── browser.py       # Browser automation layer (CDP via Playwright)
+│   └── environment.py   # Custom Gymnasium environment
+├── train.py             # SAC training with checkpointing / resume
+├── evaluate.py          # Deterministic model evaluation
+├── environment.py       # Compatibility shim (imports from docking/)
+├── requirements.txt     # Python dependencies
+└── README.md
+```
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
+
+## Setup
+
+### 1 — Configure CSS selectors
+
+Open the simulator in a browser, press **F12** to open DevTools, and use the
+Elements inspector to find the CSS selectors for each control button and state
+readout.  Fill them in `docking/browser.py`:
+
+```python
+BUTTON_SELECTORS = {
+    "translate_forward":  "#translate-forward-button",  # example
+    # … fill in all 12 entries …
+}
+
+STATE_SELECTORS = {
+    "x":    "#x-error-number",  # example
+    # … fill in all 8 entries …
+}
+```
+
+### 2 — Choose a browser mode
+
+There are two ways to connect to the simulator:
+
+**Option A — Managed mode (Playwright launches the browser)**
+
+Pass `--launch-browser` to any script.  Playwright starts a Chromium browser,
+navigates to the simulator automatically, and closes it on exit.  No manual
+Chrome setup is needed:
+
+```bash
+python train.py --launch-browser
+```
+
+**Option B — CDP mode (connect to a manually-opened Chrome)**
+
+Start Chrome with remote debugging enabled and navigate to the simulator:
+
+```bash
+google-chrome --remote-debugging-port=9222 https://iss-sim.spacex.com/
+```
+
+On macOS:
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+    --remote-debugging-port=9222 https://iss-sim.spacex.com/
+```
+
+Then run the scripts without `--launch-browser` (the default):
+
+```bash
+python train.py
+```
+
+## Usage
+
+### Train
+
+```bash
+# Managed mode — browser launched automatically
+python train.py --launch-browser
+
+# CDP mode — connect to a manually-opened Chrome (default)
+python train.py
+```
+
+Optional arguments:
+
+| Argument | Default | Description |
+|---|---|---|
+| `--launch-browser` | *(flag)* | Let Playwright launch Chromium automatically |
+| `--headless` | *(flag)* | Run browser without a visible window (with `--launch-browser`) |
+| `--timesteps` | 500 000 | Total training timesteps |
+| `--model-path` | `models/sac_docking` | Where to save the model |
+| `--resume` | *(flag)* | Continue from an existing model |
+| `--checkpoint-freq` | 10 000 | Steps between checkpoint saves |
+| `--checkpoint-dir` | `checkpoints` | Directory for checkpoint files |
+
+Example — resume a previous run in managed mode:
+
+```bash
+python train.py --launch-browser --resume --model-path models/sac_docking --timesteps 1000000
+```
+
+### Evaluate
+
+```bash
+# Managed mode
+python evaluate.py --launch-browser --model models/sac_docking --episodes 10
+
+# CDP mode
+python evaluate.py --model models/sac_docking --episodes 10
+```
+
+Optional arguments:
+
+| Argument | Default | Description |
+|---|---|---|
+| `--launch-browser` | *(flag)* | Let Playwright launch Chromium automatically |
+| `--headless` | *(flag)* | Run browser without a visible window (with `--launch-browser`) |
+| `--model` | `models/sac_docking` | Path to trained model |
+| `--episodes` | 10 | Number of evaluation episodes |
+
+## License
+
+See [LICENSE](LICENSE).
