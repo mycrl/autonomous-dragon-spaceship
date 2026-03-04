@@ -32,6 +32,9 @@ Supports two operating modes:
 
     Type ``y`` and press Enter to proceed.  This keeps the browser visible so
     the operator can click the simulator's own START button first.
+
+    Between episodes, :meth:`SimulatorBrowser.reset` clicks the simulator's
+    in-page restart button (``#option-restart``) instead of reloading the page.
 """
 
 import logging
@@ -204,23 +207,32 @@ class SimulatorBrowser:
     # Episode control
     # ------------------------------------------------------------------
 
+    # CSS selector for the in-simulator restart button.
+    RESTART_BUTTON_SELECTOR: str = "#option-restart"
+
     def reset(self, wait: float = 5.0) -> None:
-        """Reload the simulator page to start a new episode.
+        """Reset the simulator to start a new episode.
+
+        Clicks the simulator's own restart button (``#option-restart``) to
+        return to the initial state without reloading the page.  On the very
+        first call after :meth:`connect` the click is skipped because the
+        simulator has already been freshly started.
 
         Parameters
         ----------
         wait:
-            Extra seconds to sleep after the page finishes loading so that
-            the simulator's initialisation animation can complete.
+            Extra seconds to sleep after clicking restart so that the
+            simulator's initialisation animation can complete.
         """
         self._require_page()
         if self._skip_next_reset_reload:
             self._skip_next_reset_reload = False
         else:
-            self._page.reload(
-                wait_until="networkidle",
+            self._page.click(
+                self.RESTART_BUTTON_SELECTOR,
                 timeout=int(self._page_load_timeout * 1_000),
             )
+            logger.info("Clicked restart button (%s).", self.RESTART_BUTTON_SELECTOR)
         time.sleep(wait)
         self._ensure_simulator_started()
 
