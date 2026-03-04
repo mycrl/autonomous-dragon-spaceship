@@ -1,13 +1,13 @@
 """
 Evaluation script for the SpaceX ISS Docking Simulator.
 
-Loads a trained DQN model and runs it on the browser-based SpaceX ISS Docking
+Loads a trained SAC model and runs it on the browser-based SpaceX ISS Docking
 Simulator in deterministic mode, then prints per-episode and aggregate stats.
 
 Usage
 -----
     # Auto-launch the browser (managed mode)
-    python evaluate.py --launch-browser --model models/dqn_docking --episodes 10
+    python evaluate.py --launch-browser --model models/sac_docking --episodes 10
 
     # Connect to a manually-opened Chrome instance (CDP mode, default)
     python evaluate.py --model models/dqn_docking --episodes 10
@@ -20,7 +20,7 @@ import argparse
 import logging
 
 import numpy as np
-from stable_baselines3 import DQN
+from stable_baselines3 import SAC
 
 from docking import IssDockingEnv
 
@@ -39,7 +39,7 @@ def evaluate(
     Parameters
     ----------
     model_path:
-        Path to the saved DQN model (with or without the ``.zip`` extension).
+        Path to the saved SAC model (with or without the ``.zip`` extension).
     n_episodes:
         Number of episodes to evaluate.
     launch_browser:
@@ -50,7 +50,7 @@ def evaluate(
         visible window when ``True``.
     """
     env = IssDockingEnv(launch_browser=launch_browser, headless=headless)
-    model = DQN.load(model_path, env=env)
+    model = SAC.load(model_path, env=env)
 
     episode_rewards: list[float] = []
     successes = 0
@@ -88,12 +88,12 @@ def evaluate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained DQN agent on the SpaceX ISS Docking Simulator.",
+        description="Evaluate a trained SAC agent on the SpaceX ISS Docking Simulator.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--model",
-        default="models/dqn_docking",
+        default="models/sac_docking",
         help="Path to the trained model file.",
     )
     parser.add_argument(

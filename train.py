@@ -1,7 +1,7 @@
 """
 Training script for the SpaceX ISS Docking Simulator.
 
-Uses Deep Q-Network (DQN) from Stable-Baselines3 to train an agent on the
+Uses Soft Actor-Critic (SAC) from Stable-Baselines3 to train an agent on the
 browser-based SpaceX ISS Docking Simulator (https://iss-sim.spacex.com/).
 
 Only a single simulator instance can run at a time, so training is sequential
@@ -17,7 +17,7 @@ Usage
     python train.py
 
     # Resume from the latest saved model and replay buffer
-    python train.py --launch-browser --resume --model-path models/dqn_docking
+    python train.py --launch-browser --resume --model-path models/sac_docking
 
     # Customise training length and checkpoint frequency
     python train.py --launch-browser --timesteps 1000000 --checkpoint-freq 20000
@@ -33,8 +33,10 @@ import argparse
 import importlib.util
 import logging
 import os
+from typing import Any
 
-from stable_baselines3 import DQN
+from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 
@@ -55,6 +57,35 @@ def _get_tensorboard_log_dir() -> str | None:
     return "./logs/"
 
 
+class SaveOnSuccessCallback(BaseCallback):
+    """Save model/replay buffer as soon as a successful docking episode occurs."""
+
+    def __init__(self, model_path: str, replay_buffer_base: str, verbose: int = 0) -> None:
+        super().__init__(verbose)
+        self.model_path = model_path
+        self.replay_buffer_base = replay_buffer_base
+        self._save_count = 0
+
+    def _on_step(self) -> bool:
+        infos: list[dict[str, Any]] = self.locals.get("infos", [])
+        dones = self.locals.get("dones")
+
+        if dones is None:
+            return True
+
+        for done, info in zip(dones, infos):
+            if bool(done) and bool(info.get("success", False)):
+                self.model.save(self.model_path)
+                self.model.save_replay_buffer(self.replay_buffer_base)
+                self._save_count += 1
+                logger.info(
+                    "Docking success detected; model auto-saved to '%s.zip' (count=%d)",
+                    self.model_path,
+                    self._save_count,
+                )
+        return True
+
+
 def train(
     model_path: str,
     timesteps: int,
@@ -63,8 +94,11 @@ def train(
     checkpoint_dir: str,
     launch_browser: bool,
     headless: bool,
+    control_interval_steps: int,
+    action_confirmation_steps: int,
+    adaptive_control: bool,
 ) -> None:
-    """Train a DQN agent on the ISS docking environment.
+    """Train an SAC agent on the ISS docking environment.
 
     Parameters
     ----------
@@ -85,8 +119,25 @@ def train(
     headless:
         Only used when ``launch_browser=True``.  Run the browser without a
         visible window when ``True``.
+    control_interval_steps:
+        Execute one real control input every N environment steps to avoid
+        over-control under inertia.
+    action_confirmation_steps:
+        In non-high-risk states, require the same intended command for N
+        consecutive policy steps before executing a thrust click.
+    adaptive_control:
+        Dynamically increase/decrease control authority based on simulator
+        risk state (distance, attitude, angular rates, closing rate).
     """
-    env = Monitor(IssDockingEnv(launch_browser=launch_browser, headless=headless))
+    env = Monitor(
+        IssDockingEnv(
+            launch_browser=launch_browser,
+            headless=headless,
+            control_interval_steps=control_interval_steps,
+            action_confirmation_steps=action_confirmation_steps,
+            adaptive_control=adaptive_control,
+        )
+    )
 
     # SB3's save_replay_buffer appends ".pkl" automatically; use the base path
     # everywhere and check for the ".pkl" file on disk when resuming.
@@ -95,27 +146,24 @@ def train(
 
     if resume and os.path.exists(model_path + ".zip"):
         logger.info("Resuming training from '%s.zip' …", model_path)
-        model = DQN.load(model_path, env=env)
+        model = SAC.load(model_path, env=env)
         if os.path.exists(replay_buffer_file):
             model.load_replay_buffer(replay_buffer_file)
             logger.info("Replay buffer loaded from '%s'", replay_buffer_file)
     else:
         logger.info("Starting fresh training …")
-        model = DQN(
+        model = SAC(
             policy="MlpPolicy",
             env=env,
             verbose=1,
-            learning_rate=1e-4,
+            learning_rate=3e-4,
             buffer_size=100_000,
             learning_starts=1_000,
-            batch_size=32,
-            tau=1.0,
+            batch_size=256,
+            tau=0.005,
             gamma=0.99,
-            train_freq=4,
+            train_freq=1,
             gradient_steps=1,
-            target_update_interval=1_000,
-            exploration_fraction=0.1,
-            exploration_final_eps=0.05,
             tensorboard_log=_get_tensorboard_log_dir(),
         )
 
@@ -123,14 +171,18 @@ def train(
     checkpoint_callback = CheckpointCallback(
         save_freq=checkpoint_freq,
         save_path=checkpoint_dir,
-        name_prefix="dqn_docking",
+        name_prefix="sac_docking",
         save_replay_buffer=True,
+    )
+    success_save_callback = SaveOnSuccessCallback(
+        model_path=model_path,
+        replay_buffer_base=replay_buffer_base,
     )
 
     logger.info("Training DQN for %s timesteps …", f"{timesteps:,}")
     model.learn(
         total_timesteps=timesteps,
-        callback=checkpoint_callback,
+        callback=[checkpoint_callback, success_save_callback],
         reset_num_timesteps=not resume,
     )
 
@@ -144,12 +196,12 @@ def train(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train a DQN agent on the SpaceX ISS Docking Simulator.",
+        description="Train an SAC agent on the SpaceX ISS Docking Simulator.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--model-path",
-        default="models/dqn_docking",
+        default="models/sac_docking",
         help="Path to save (or load, when resuming) the model.",
     )
     parser.add_argument(
@@ -187,6 +239,30 @@ def main() -> None:
         action="store_true",
         help="Run the browser without a visible window (only used with --launch-browser).",
     )
+    parser.add_argument(
+        "--control-interval-steps",
+        type=int,
+        default=2,
+        help="Execute one control input every N env steps (>=1). Larger values reduce control frequency.",
+    )
+    parser.add_argument(
+        "--action-confirmation-steps",
+        type=int,
+        default=2,
+        help="Require same intended command for N consecutive steps before executing (except high-risk states).",
+    )
+    parser.add_argument(
+        "--adaptive-control",
+        action="store_true",
+        help="Enable adaptive control authority (default).",
+    )
+    parser.add_argument(
+        "--no-adaptive-control",
+        dest="adaptive_control",
+        action="store_false",
+        help="Disable adaptive control and keep fixed control interval.",
+    )
+    parser.set_defaults(adaptive_control=True)
     args = parser.parse_args()
 
     train(
@@ -197,6 +273,9 @@ def main() -> None:
         checkpoint_dir=args.checkpoint_dir,
         launch_browser=args.launch_browser,
         headless=args.headless,
+        control_interval_steps=args.control_interval_steps,
+        action_confirmation_steps=args.action_confirmation_steps,
+        adaptive_control=args.adaptive_control,
     )
 
 

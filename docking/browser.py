@@ -23,17 +23,9 @@ Supports two operating modes:
         browser.connect()
 
 .. note::
-    When running in managed mode (``launch=True``), the simulator page requires
-    a manual START interaction before gameplay begins.  After the page finishes
-    loading, :meth:`SimulatorBrowser.connect` (and :meth:`SimulatorBrowser.reset`
-    on each episode) will pause and prompt::
-
-        Simulator page loaded. Click START in the browser, then press [y] + Enter:
-
-    Type ``y`` and press Enter to proceed.  This keeps the browser visible so
-    the operator can click the simulator's own START button first.
-
-    Between episodes, :meth:`SimulatorBrowser.reset` clicks the simulator's
+    In managed mode, :meth:`SimulatorBrowser.connect` asks for a one-time
+    manual confirmation after the page first loads.  Between episodes,
+    :meth:`SimulatorBrowser.reset` is fully automatic and clicks the
     in-page restart button (``#option-restart``) instead of reloading the page.
 """
 
@@ -155,8 +147,11 @@ class SimulatorBrowser:
         self._playwright = sync_playwright().start()
 
         if self._launch:
-            self._browser = self._playwright.chromium.launch(headless=self._headless)
-            context = self._browser.new_context()
+            self._browser = self._playwright.chromium.launch(
+                headless=self._headless,
+                args=["--start-maximized"],
+            )
+            context = self._browser.new_context(no_viewport=True)
             self._page = context.new_page()
             self._page.goto(
                 self.SIMULATOR_URL,
@@ -164,7 +159,7 @@ class SimulatorBrowser:
                 timeout=int(self._page_load_timeout * 1_000),
             )
             self._skip_next_reset_reload = True
-            self._ensure_simulator_started()
+            self._wait_for_user_start()
             logger.info("Launched browser and navigated to %s", self.SIMULATOR_URL)
         else:
             self._browser = self._playwright.chromium.connect_over_cdp(self._cdp_url)
@@ -225,16 +220,18 @@ class SimulatorBrowser:
             simulator's initialisation animation can complete.
         """
         self._require_page()
+        page = self._page
+        assert page is not None
         if self._skip_next_reset_reload:
             self._skip_next_reset_reload = False
         else:
-            self._page.click(
+            page.click(
                 self.RESTART_BUTTON_SELECTOR,
                 timeout=int(self._page_load_timeout * 1_000),
             )
             logger.info("Clicked restart button (%s).", self.RESTART_BUTTON_SELECTOR)
-        time.sleep(wait)
-        self._ensure_simulator_started()
+        if wait > 0:
+            time.sleep(wait)
 
     # ------------------------------------------------------------------
     # Actions & observations
@@ -254,13 +251,15 @@ class SimulatorBrowser:
             If the selector for *action_name* has not been configured.
         """
         self._require_page()
+        page = self._page
+        assert page is not None
         selector = self.BUTTON_SELECTORS.get(action_name)
         if not selector:
             raise ValueError(
                 f"Selector for action '{action_name}' is not configured. "
                 "Fill in BUTTON_SELECTORS with the correct CSS selectors."
             )
-        self._page.click(selector)
+        page.click(selector)
 
     def read_state(self) -> dict[str, float]:
         """Read the current simulator state from the page DOM.
@@ -281,6 +280,8 @@ class SimulatorBrowser:
             If any selector in :attr:`STATE_SELECTORS` has not been configured.
         """
         self._require_page()
+        page = self._page
+        assert page is not None
         state: dict[str, float] = {}
         for key, selector in self.STATE_SELECTORS.items():
             if not selector:
@@ -288,7 +289,7 @@ class SimulatorBrowser:
                     f"Selector for state '{key}' is not configured. "
                     "Fill in STATE_SELECTORS with the correct CSS selectors."
                 )
-            text = self._page.inner_text(selector).strip()
+            text = page.inner_text(selector).strip()
             # The DOM includes units (e.g. "200.0 m", "15.0°", "0.039 m/s").
             # Extract just the leading numeric token (with optional sign).
             match = re.search(r"-?\d+\.?\d*", text)
@@ -330,11 +331,10 @@ class SimulatorBrowser:
     # ------------------------------------------------------------------
 
     def _wait_for_user_start(self) -> None:
-        """Pause and wait for the operator to confirm the simulator has started.
+        """Pause and wait for one-time operator confirmation.
 
-        Prints a prompt to stdout and blocks until the user types ``y`` (or
-        ``Y``) and presses Enter.  This gives the operator time to click the
-        simulator's own START button in the browser before training proceeds.
+        Blocks until the user types ``y`` and presses Enter. This is only used
+        right after the initial page load in managed mode.
         """
         while True:
             answer = input(
@@ -344,41 +344,6 @@ class SimulatorBrowser:
             if answer == "y":
                 break
             print("Please type 'y' and press Enter to continue.")
-
-    def _try_click_start(self) -> bool:
-        """Try to click a START control automatically.
-
-        Returns ``True`` when a likely START element is found and clicked,
-        otherwise returns ``False``.
-        """
-        self._require_page()
-        candidates = [
-            lambda: self._page.locator("button:has-text('START')").first,
-            lambda: self._page.get_by_text("START", exact=False).first,
-            lambda: self._page.locator("text=START").first,
-        ]
-        for get_locator in candidates:
-            try:
-                locator = get_locator()
-                if locator.count() > 0:
-                    locator.click(timeout=1_500)
-                    logger.info("Simulator START clicked automatically.")
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _ensure_simulator_started(self) -> None:
-        """Ensure simulator has passed the START screen.
-
-        First attempts to click START automatically. If that fails and the
-        browser is visible, falls back to manual confirmation.
-        """
-        if self._try_click_start():
-            return
-
-        if self._launch and not self._headless:
-            self._wait_for_user_start()
 
     def _require_page(self) -> None:
         """Raise :class:`RuntimeError` if not yet connected."""
