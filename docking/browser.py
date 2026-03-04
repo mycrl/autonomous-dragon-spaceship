@@ -23,9 +23,15 @@ Supports two operating modes:
         browser.connect()
 
 .. note::
-    Fill in :attr:`SimulatorBrowser.START_BUTTON_SELECTOR` with the correct
-    CSS selector for the button that starts the simulation after the page loads
-    (inspect the simulator page with F12 → DevTools to find it).
+    When running in managed mode (``launch=True``), the simulator page requires
+    a manual START interaction before gameplay begins.  After the page finishes
+    loading, :meth:`SimulatorBrowser.connect` (and :meth:`SimulatorBrowser.reset`
+    on each episode) will pause and prompt::
+
+        Simulator page loaded. Click START in the browser, then press [y] + Enter:
+
+    Type ``y`` and press Enter to proceed.  This keeps the browser visible so
+    the operator can click the simulator's own START button first.
 """
 
 import logging
@@ -112,10 +118,6 @@ class SimulatorBrowser:
         "pitch_rate": "#pitch div:nth-child(2)",
     }
 
-    # Selector for the button that starts the simulation after the page loads.
-    # TODO: Replace with the correct CSS selector for the START/BEGIN button.
-    START_BUTTON_SELECTOR: str = ""
-
     def __init__(
         self,
         launch: bool = False,
@@ -156,7 +158,7 @@ class SimulatorBrowser:
                 wait_until="networkidle",
                 timeout=int(self._page_load_timeout * 1_000),
             )
-            self._click_start()
+            self._wait_for_user_start()
             logger.info("Launched browser and navigated to %s", self.SIMULATOR_URL)
         else:
             self._browser = self._playwright.chromium.connect_over_cdp(self._cdp_url)
@@ -214,7 +216,7 @@ class SimulatorBrowser:
             timeout=int(self._page_load_timeout * 1_000),
         )
         time.sleep(wait)
-        self._click_start()
+        self._wait_for_user_start()
 
     # ------------------------------------------------------------------
     # Actions & observations
@@ -306,26 +308,21 @@ class SimulatorBrowser:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _click_start(self) -> None:
-        """Click the START/BEGIN button after the simulator page loads.
+    def _wait_for_user_start(self) -> None:
+        """Pause and wait for the operator to confirm the simulator has started.
 
-        Waits for the button specified by :attr:`START_BUTTON_SELECTOR` to
-        become visible, then clicks it.  If :attr:`START_BUTTON_SELECTOR` is
-        empty, this method is a no-op.
+        Prints a prompt to stdout and blocks until the user types ``y`` (or
+        ``Y``) and presses Enter.  This gives the operator time to click the
+        simulator's own START button in the browser before training proceeds.
         """
-        if not self.START_BUTTON_SELECTOR:
-            logger.debug(
-                "START_BUTTON_SELECTOR not configured; skipping auto-start click."
-            )
-            return
-        self._require_page()
-        self._page.wait_for_selector(
-            self.START_BUTTON_SELECTOR,
-            state="visible",
-            timeout=int(self._page_load_timeout * 1_000),
-        )
-        self._page.click(self.START_BUTTON_SELECTOR)
-        logger.info("Clicked START button; simulation is running.")
+        while True:
+            answer = input(
+                "Simulator page loaded. Click START in the browser, "
+                "then press [y] + Enter to continue: "
+            ).strip().lower()
+            if answer == "y":
+                break
+            print("Please type 'y' and press Enter to continue.")
 
     def _require_page(self) -> None:
         """Raise :class:`RuntimeError` if not yet connected."""
