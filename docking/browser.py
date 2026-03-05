@@ -46,9 +46,11 @@ from playwright.sync_api import (
     BrowserContext,
     Page,
     Playwright,
-    TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
 )
+
+from .browser_shared import SharedLaunchCoordinator
+from .browser_startup import BrowserStartupCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -249,90 +251,11 @@ class SimulatorBrowser:
 
     def _connect_shared_launch(self) -> None:
         """Connect using a single shared browser and one tab per env."""
-        if SimulatorBrowser._shared_browser is None:
-            shared_playwright = sync_playwright().start()
-            shared_browser = shared_playwright.chromium.launch(
-                headless=self._headless,
-                args=self.BROWSER_LAUNCH_ARGS,
-            )
-            shared_context = shared_browser.new_context(no_viewport=True)
-            SimulatorBrowser._shared_playwright = shared_playwright
-            SimulatorBrowser._shared_browser = shared_browser
-            SimulatorBrowser._shared_context = shared_context
-            SimulatorBrowser._shared_ref_count = 0
-            SimulatorBrowser._shared_instances = []
-            SimulatorBrowser._shared_tabs_prepared = False
-            SimulatorBrowser._shared_expected_tabs = self._expected_shared_tabs
-        else:
-            SimulatorBrowser._shared_expected_tabs = max(
-                SimulatorBrowser._shared_expected_tabs,
-                self._expected_shared_tabs,
-            )
-
-        assert SimulatorBrowser._shared_context is not None
-        self._playwright = SimulatorBrowser._shared_playwright
-        self._browser = SimulatorBrowser._shared_browser
-        self._context = SimulatorBrowser._shared_context
-        self._page = self._context.new_page()
-
-        self._page.goto(
-            self.SIMULATOR_URL,
-            wait_until="domcontentloaded",
-            timeout=int(self._page_load_timeout * 1_000),
-        )
-        self._skip_next_reset_reload = True
-        SimulatorBrowser._shared_instances.append(self)
-
-        SimulatorBrowser._shared_ref_count += 1
-        logger.info(
-            "Attached shared browser tab (%d/%d).",
-            SimulatorBrowser._shared_ref_count,
-            SimulatorBrowser._shared_expected_tabs,
-        )
-
-        if (
-            not SimulatorBrowser._shared_tabs_prepared
-            and len(SimulatorBrowser._shared_instances) >= SimulatorBrowser._shared_expected_tabs
-        ):
-            self._prepare_all_shared_tabs_before_training()
+        SharedLaunchCoordinator.connect_shared_launch(self)
 
     def _disconnect_shared_launch(self) -> None:
         """Close only this tab; close shared browser when last tab exits."""
-        if self in SimulatorBrowser._shared_instances:
-            SimulatorBrowser._shared_instances.remove(self)
-
-        if self._page is not None:
-            try:
-                self._page.close()
-            except Exception:
-                pass
-
-        self._page = None
-        self._context = None
-        self._browser = None
-        self._playwright = None
-
-        SimulatorBrowser._shared_ref_count = max(0, SimulatorBrowser._shared_ref_count - 1)
-        if SimulatorBrowser._shared_ref_count > 0:
-            return
-
-        if SimulatorBrowser._shared_browser is not None:
-            try:
-                SimulatorBrowser._shared_browser.close()
-            except Exception:
-                pass
-        if SimulatorBrowser._shared_playwright is not None:
-            try:
-                SimulatorBrowser._shared_playwright.stop()
-            except Exception:
-                pass
-
-        SimulatorBrowser._shared_context = None
-        SimulatorBrowser._shared_browser = None
-        SimulatorBrowser._shared_playwright = None
-        SimulatorBrowser._shared_instances = []
-        SimulatorBrowser._shared_tabs_prepared = False
-        SimulatorBrowser._shared_expected_tabs = 0
+        SharedLaunchCoordinator.disconnect_shared_launch(self)
 
     # ------------------------------------------------------------------
     # Episode control
@@ -494,228 +417,42 @@ class SimulatorBrowser:
 
     def _read_preloader_percent(self, page: Page, timeout_ms: int = 1000) -> tuple[int | None, str]:
         """Return parsed percent and raw text from #preloader-percent."""
-        try:
-            raw = page.locator(self.PRELOADER_PERCENT_SELECTOR).first.text_content(
-                timeout=timeout_ms
-            )
-        except PlaywrightTimeoutError:
-            return None, ""
-        except Exception:
-            return None, ""
-
-        text = (raw or "").strip()
-        match = re.search(r"\d{1,3}(?:\.\d+)?", text)
-        if not match:
-            return None, text
-
-        try:
-            return int(float(match.group(0))), text
-        except ValueError:
-            return None, text
+        return BrowserStartupCoordinator.read_preloader_percent(
+            self,
+            page=page,
+            timeout_ms=timeout_ms,
+        )
 
     def _wait_for_begin_button_ready(self, page: Page, timeout_seconds: float) -> None:
         """Wait until begin button is visible/clickable in the DOM."""
-        deadline = time.time() + max(1.0, timeout_seconds)
-        last_error: str = ""
-
-        while time.time() < deadline:
-            try:
-                locator = page.locator(self.BEGIN_BUTTON_SELECTOR).first
-                if locator.is_visible(timeout=200):
-                    return
-            except Exception as exc:
-                last_error = str(exc)
-
-            time.sleep(self.BEGIN_CLICK_RETRY_INTERVAL_SECONDS)
-
-        raise RuntimeError(
-            "Timed out waiting for begin button readiness: "
-            f"selector={self.BEGIN_BUTTON_SELECTOR}, last_error='{last_error}'"
+        BrowserStartupCoordinator.wait_for_begin_button_ready(
+            self,
+            page=page,
+            timeout_seconds=timeout_seconds,
         )
 
     def _click_begin_button_with_retries(self, page: Page, timeout_seconds: float) -> None:
         """Click begin with retries and JS fallback for transient click failures."""
-        deadline = time.time() + max(1.0, timeout_seconds)
-        last_error: str = ""
-
-        while time.time() < deadline:
-            try:
-                page.click(
-                    self.BEGIN_BUTTON_SELECTOR,
-                    timeout=1000,
-                    force=True,
-                )
-                logger.info("Clicked begin button: %s", self.BEGIN_BUTTON_SELECTOR)
-                return
-            except Exception as exc:
-                last_error = str(exc)
-
-            try:
-                clicked = bool(
-                    page.evaluate(
-                        """
-                        (selector) => {
-                            const el = document.querySelector(selector);
-                            if (!el) {
-                                return false;
-                            }
-                            el.click();
-                            return true;
-                        }
-                        """,
-                        self.BEGIN_BUTTON_SELECTOR,
-                    )
-                )
-                if clicked:
-                    logger.info("Clicked begin button via JS: %s", self.BEGIN_BUTTON_SELECTOR)
-                    return
-            except Exception as exc:
-                last_error = str(exc)
-
-            time.sleep(self.BEGIN_CLICK_RETRY_INTERVAL_SECONDS)
-
-        raise RuntimeError(
-            "Timed out clicking begin button: "
-            f"selector={self.BEGIN_BUTTON_SELECTOR}, last_error='{last_error}'"
+        BrowserStartupCoordinator.click_begin_button_with_retries(
+            self,
+            page=page,
+            timeout_seconds=timeout_seconds,
         )
 
     def _prepare_all_shared_tabs_before_training(self) -> None:
         """Run fixed startup flow for all shared tabs and block until all are ready."""
-        if SimulatorBrowser._shared_tabs_prepared:
-            return
-
-        instances = [inst for inst in SimulatorBrowser._shared_instances if inst._page is not None]
-        if not instances:
-            raise RuntimeError("No shared tab instances available for startup.")
-
-        timeout_seconds = max(self._page_load_timeout * 4, 600.0)
-        deadline = time.time() + timeout_seconds
-
-        state: dict[int, dict[str, float | str]] = {}
-        for inst in instances:
-            state[id(inst)] = {
-                "phase": "wait_preloader",
-                "preloader_ready_at": 0.0,
-                "begin_clicked_at": 0.0,
-            }
-
-        logger.info(
-            "Preparing %d shared tabs in parallel startup workflow ...",
-            len(instances),
-        )
-
-        while time.time() < deadline:
-            now = time.time()
-            all_done = True
-
-            for inst in instances:
-                if inst._page is None:
-                    continue
-
-                tab_state = state[id(inst)]
-                phase = str(tab_state["phase"])
-
-                if phase == "done":
-                    continue
-
-                all_done = False
-                page = inst._page
-
-                if phase == "wait_preloader":
-                    try:
-                        percent, _ = inst._read_preloader_percent(page, timeout_ms=300)
-                        if percent is not None and percent >= 100:
-                            tab_state["preloader_ready_at"] = now
-                            tab_state["phase"] = "wait_after_load"
-                    except PlaywrightTimeoutError:
-                        pass
-                    except Exception:
-                        pass
-                    continue
-
-                if phase == "wait_after_load":
-                    preloader_ready_at = float(tab_state["preloader_ready_at"])
-                    if (now - preloader_ready_at) >= self.AFTER_LOAD_WAIT_SECONDS:
-                        try:
-                            inst._wait_for_begin_button_ready(page, timeout_seconds=8.0)
-                            inst._click_begin_button_with_retries(page, timeout_seconds=8.0)
-                            tab_state["begin_clicked_at"] = now
-                            tab_state["phase"] = "wait_after_begin"
-                        except Exception:
-                            pass
-                    continue
-
-                if phase == "wait_after_begin":
-                    begin_clicked_at = float(tab_state["begin_clicked_at"])
-                    if (now - begin_clicked_at) >= self.AFTER_BEGIN_WAIT_SECONDS:
-                        tab_state["phase"] = "done"
-                        inst._startup_completed = True
-                        inst._skip_next_reset_reload = True
-                    continue
-
-            if all_done:
-                SimulatorBrowser._shared_tabs_prepared = True
-                logger.info("All shared tabs are ready; starting parallel training.")
-                return
-
-            time.sleep(self.PRELOADER_POLL_INTERVAL_SECONDS)
-
-        raise RuntimeError(
-            "Timed out while preparing shared tabs for startup. "
-            f"expected={SimulatorBrowser._shared_expected_tabs}, connected={len(instances)}"
-        )
+        BrowserStartupCoordinator.prepare_all_shared_tabs_before_training(self)
 
     def _wait_for_preloader_complete(self, timeout_seconds: float) -> None:
         """Wait until #preloader-percent reaches 100."""
-        self._require_page()
-        page = self._page
-        assert page is not None
-
-        deadline = time.time() + timeout_seconds
-        last_seen: str = ""
-
-        while time.time() < deadline:
-            try:
-                percent, text = self._read_preloader_percent(page, timeout_ms=1000)
-                if text:
-                    last_seen = text
-                if percent is not None and percent >= 100:
-                    logger.info("Preloader reached 100%% (%s).", last_seen or text)
-                    return
-            except PlaywrightTimeoutError:
-                pass
-            except Exception:
-                pass
-
-            time.sleep(self.PRELOADER_POLL_INTERVAL_SECONDS)
-
-        raise RuntimeError(
-            "Timed out waiting for preloader completion: "
-            f"selector={self.PRELOADER_PERCENT_SELECTOR}, last_seen='{last_seen}'"
+        BrowserStartupCoordinator.wait_for_preloader_complete(
+            self,
+            timeout_seconds=timeout_seconds,
         )
 
     def _auto_start_simulator_if_needed(self) -> None:
         """Run deterministic managed-mode startup sequence."""
-        self._require_page()
-        page = self._page
-        assert page is not None
-
-        # Step 1: wait until preloader shows 100%.
-        self._wait_for_preloader_complete(timeout_seconds=max(self._page_load_timeout * 4, 600.0))
-
-        # Step 2: wait 10s, then click begin.
-        time.sleep(self.AFTER_LOAD_WAIT_SECONDS)
-        self._wait_for_begin_button_ready(
-            page,
-            timeout_seconds=max(self._page_load_timeout, 10.0),
-        )
-        self._click_begin_button_with_retries(
-            page,
-            timeout_seconds=max(self._page_load_timeout, 10.0),
-        )
-
-        # Step 3: wait another 10s to ensure simulator is ready.
-        time.sleep(self.AFTER_BEGIN_WAIT_SECONDS)
+        BrowserStartupCoordinator.auto_start_simulator_if_needed(self)
 
     def _require_page(self) -> None:
         """Raise :class:`RuntimeError` if not yet connected."""
