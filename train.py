@@ -1,74 +1,85 @@
 """
-Training script for the SpaceX ISS Docking Simulator.
+Training script for the SpaceX ISS Docking Simulator (Fast Version).
 
-Uses Proximal Policy Optimization (PPO) from Stable-Baselines3 to train an agent on the
-browser-based SpaceX ISS Docking Simulator (https://iss-sim.spacex.com/).
-
-Supports vectorized training with multiple simulator environments. By default,
-each environment runs in its own browser process (true parallelism via
-`SubprocVecEnv`). Optionally, you can use one shared browser with multiple
-tabs. A checkpoint callback saves the model periodically, and the `--resume`
-flag lets you continue training from a previous run.
-
-Usage
------
-    # Default: 5 environments in parallel (one browser per env)
-    python train.py --headless
-
-    # Force single-environment CDP mode with a manually-opened Chrome
-    python train.py --num-envs 1
-
-    # Resume from the latest saved model and replay buffer
-    python train.py --launch-browser --resume --model-path models/ppo_docking
-
-    # Customise training length and checkpoint frequency
-    python train.py --launch-browser --timesteps 1000000 --checkpoint-freq 20000
-
-In CDP mode, start Chrome with remote debugging enabled before running::
-
-    google-chrome --remote-debugging-port=9222 https://iss-sim.spacex.com/
-
-Then run this script.
+Uses Proximal Policy Optimization (PPO) from Stable-Baselines3 to train an agent.
+To maximise performance, this script exclusively uses the purely Python-based
+FastIssDockingEnv, achieving thousands of steps per second.
 """
 
 import argparse
 import importlib.util
-import json
 import logging
 import os
-from pathlib import Path
-from typing import Callable
-from typing import Any
+import time
+from typing import Callable, Any
 
+import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.vec_env import VecMonitor
 from stable_baselines3.common.vec_env import VecNormalize
 
-from docking import IssDockingEnv
+from docking import FastIssDockingEnv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def _get_tensorboard_log_dir() -> str | None:
-    """Return TensorBoard log directory when tensorboard is available."""
-    if importlib.util.find_spec("tensorboard") is None:
+def _safe_save_model(model: PPO, path: str, reason: str, max_retries: int = 2) -> str | None:
+    """Save model robustly against transient filesystem errors on Windows."""
+    dir_path = os.path.dirname(path)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+
+    for attempt in range(max_retries + 1):
+        try:
+            model.save(path)
+            return path
+        except OSError as exc:
+            if attempt >= max_retries:
+                break
+            delay_seconds = 0.2 * (attempt + 1)
+            logger.warning(
+                "Model save failed (%s) at '%s' (attempt %d/%d): %s. Retrying in %.1fs ...",
+                reason,
+                path,
+                attempt + 1,
+                max_retries + 1,
+                exc,
+                delay_seconds,
+            )
+            time.sleep(delay_seconds)
+
+    fallback_path = f"{path}_fallback_{int(time.time())}"
+    try:
+        model.save(fallback_path)
         logger.warning(
-            "tensorboard is not installed; disabling TensorBoard logging. "
-            "Install it with: pip install tensorboard"
+            "Primary save failed (%s). Saved fallback model to '%s.zip' instead.",
+            reason,
+            fallback_path,
         )
+        return fallback_path
+    except OSError as exc:
+        logger.error(
+            "Model save permanently failed (%s) for '%s' and fallback '%s': %s",
+            reason,
+            path,
+            fallback_path,
+            exc,
+        )
+        return None
+
+
+def _get_tensorboard_log_dir() -> str | None:
+    if importlib.util.find_spec("tensorboard") is None:
         return None
     return "./logs/"
 
 
 class SaveOnSuccessCallback(BaseCallback):
-    """Save model as soon as a successful docking episode occurs."""
-
     def __init__(self, model_path: str, verbose: int = 0) -> None:
         super().__init__(verbose)
         self.model_path = model_path
@@ -83,54 +94,50 @@ class SaveOnSuccessCallback(BaseCallback):
 
         for done, info in zip(dones, infos):
             if bool(done) and bool(info.get("success", False)):
-                self.model.save(self.model_path)
-                self._save_count += 1
-                logger.info(
-                    "Docking success detected; model auto-saved to '%s.zip' (count=%d)",
-                    self.model_path,
-                    self._save_count,
-                )
+                saved_path = _safe_save_model(self.model, self.model_path, "success-autosave")
+                if saved_path is not None:
+                    self._save_count += 1
+                    logger.info(
+                        "Docking success detected; model auto-saved to '%s.zip' (count=%d)",
+                        saved_path,
+                        self._save_count,
+                    )
         return True
 
 
-def _make_env(
-    launch_browser: bool,
-    headless: bool,
-    shared_browser_tabs: bool,
-    expected_shared_tabs: int | None,
-) -> Callable[[], IssDockingEnv]:
-    """Return an env factory function for vectorized env creation."""
+class SafeCheckpointCallback(BaseCallback):
+    def __init__(self, save_freq: int, save_path: str, name_prefix: str, verbose: int = 0) -> None:
+        super().__init__(verbose)
+        self.save_freq = max(1, int(save_freq))
+        self.save_path = save_path
+        self.name_prefix = name_prefix
 
-    def _init() -> IssDockingEnv:
-        return IssDockingEnv(
-            launch_browser=launch_browser,
-            headless=headless,
-            shared_browser_tabs=shared_browser_tabs,
-            expected_shared_tabs=expected_shared_tabs,
+    def _on_step(self) -> bool:
+        if self.n_calls % self.save_freq != 0:
+            return True
+
+        checkpoint_path = os.path.join(
+            self.save_path,
+            f"{self.name_prefix}_{self.num_timesteps}_steps",
         )
+        saved_path = _safe_save_model(self.model, checkpoint_path, "periodic-checkpoint")
+        if saved_path is not None:
+            logger.info("Checkpoint saved to '%s.zip'", saved_path)
+        return True
 
+
+def _make_env() -> Callable[[], gym.Env]:
+    def _init() -> gym.Env:
+        return FastIssDockingEnv()
     return _init
 
 
 def _build_vec_env(
     num_envs: int,
-    launch_browser: bool,
-    headless: bool,
-    shared_browser_tabs: bool,
-    expected_shared_tabs: int | None,
     use_subproc_envs: bool,
-    model_path: str = "models/ppo_docking"
+    model_path: str = "models/ppo_docking",
 ) -> VecEnv:
-    """Create vectorized training environment(s)."""
-    env_fns = [
-        _make_env(
-            launch_browser=launch_browser,
-            headless=headless,
-            shared_browser_tabs=shared_browser_tabs,
-            expected_shared_tabs=expected_shared_tabs,
-        )
-        for _ in range(num_envs)
-    ]
+    env_fns = [_make_env() for _ in range(num_envs)]
 
     if num_envs > 1 and use_subproc_envs:
         env = VecMonitor(SubprocVecEnv(env_fns, start_method="spawn"))
@@ -139,7 +146,6 @@ def _build_vec_env(
     
     vec_env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
     
-    # Load running stats if resuming
     stats_path = model_path + "_vec_normalize.pkl"
     if os.path.exists(stats_path):
         logger.info(f"Loading environment normalization stats from {stats_path}")
@@ -155,45 +161,15 @@ def train(
     resume: bool,
     checkpoint_freq: int,
     checkpoint_dir: str,
-    launch_browser: bool,
-    headless: bool,
-    shared_browser_tabs: bool,
     num_envs: int,
 ) -> None:
-    # (Arguments documented in docstring ommited for brevity)
     num_envs = max(1, int(num_envs))
-    if num_envs > 1 and not launch_browser:
-        logger.warning(
-            "num_envs=%d requires managed mode for parallel browser control. "
-            "Auto-enabling managed mode (--launch-browser).",
-            num_envs,
-        )
-        launch_browser = True
-
-    shared_browser_tabs = bool(launch_browser and shared_browser_tabs and num_envs > 1)
-    expected_shared_tabs = num_envs if shared_browser_tabs else None
-    use_subproc_envs = bool(num_envs > 1 and not shared_browser_tabs)
-
-    if num_envs > 1 and not headless:
-        if shared_browser_tabs:
-            logger.warning(
-                "Running one visible browser with %d tabs. Consider --headless for lower overhead.",
-                num_envs,
-            )
-        else:
-            logger.warning(
-                "Running %d visible browser windows in parallel. Consider --headless for lower overhead.",
-                num_envs,
-            )
+    use_subproc_envs = bool(num_envs > 1)
 
     env = _build_vec_env(
         num_envs=num_envs,
-        launch_browser=launch_browser,
-        headless=headless,
-        shared_browser_tabs=shared_browser_tabs,
-        expected_shared_tabs=expected_shared_tabs,
         use_subproc_envs=use_subproc_envs,
-        model_path=model_path if resume else "None"
+        model_path=model_path if resume else "None",
     )
 
     if resume and os.path.exists(model_path + ".zip"):
@@ -210,45 +186,37 @@ def train(
             batch_size=256,
             gamma=0.99,
             gae_lambda=0.95,
-            ent_coef=0.01, # slightly higher entropy coef helps avoid premature convergence locally
+            ent_coef=0.01,
             tensorboard_log=_get_tensorboard_log_dir(),
         )
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_freq_calls = max(1, checkpoint_freq // num_envs)
-    if checkpoint_freq_calls != checkpoint_freq:
-        logger.info(
-            "Adjusted checkpoint callback frequency to %d calls for %d envs "
-            "(target every ~%d timesteps).",
-            checkpoint_freq_calls,
-            num_envs,
-            checkpoint_freq,
-        )
 
-    checkpoint_callback = CheckpointCallback(
+    checkpoint_callback = SafeCheckpointCallback(
         save_freq=checkpoint_freq_calls,
         save_path=checkpoint_dir,
         name_prefix="ppo_docking",
     )
-    success_save_callback = SaveOnSuccessCallback(
-        model_path=model_path,
-    )
+    success_save_callback = SaveOnSuccessCallback(model_path=model_path)
 
     def _save_progress(reason: str) -> None:
-        dir_path = os.path.dirname(model_path)
-        if dir_path:
-            os.makedirs(dir_path, exist_ok=True)
-        model.save(model_path)
-        env.save(model_path + "_vec_normalize.pkl")
-        logger.info("Progress saved (%s) to '%s.zip' and stats to '%s_vec_normalize.pkl'", reason, model_path, model_path)
+        saved_model_path = _safe_save_model(model, model_path, f"final-{reason}")
+        if saved_model_path is not None:
+            env.save(saved_model_path + "_vec_normalize.pkl")
+            logger.info(
+                "Progress saved (%s) to '%s.zip' and stats to '%s_vec_normalize.pkl'",
+                reason,
+                saved_model_path,
+                saved_model_path,
+            )
+        else:
+            logger.error("Could not save final model during '%s'.", reason)
 
     logger.info(
-        "Training PPO for %s timesteps with %d environment(s)%s ...",
+        "Training PPO entirely on CPU (Fast env) for %s total timesteps with %d environment(s)...",
         f"{timesteps:,}",
         num_envs,
-        " (one shared browser, multi-tab)"
-        if shared_browser_tabs
-        else " (one browser per env, subprocess parallel)",
     )
     try:
         model.learn(
@@ -263,69 +231,18 @@ def train(
     finally:
         env.close()
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train a PPO agent on the SpaceX ISS Docking Simulator.",
+        description="Fast Train a PPO agent on the pure Python SpaceX ISS Docking Simulator.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--model-path",
-        default="models/ppo_docking",
-        help="Path to save (or load, when resuming) the model.",
-    )
-    parser.add_argument(
-        "--timesteps",
-        type=int,
-        default=500_000,
-        help="Total training timesteps.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume training from an existing model.",
-    )
-    parser.add_argument(
-        "--checkpoint-freq",
-        type=int,
-        default=10_000,
-        help="Save a checkpoint every N environment steps.",
-    )
-    parser.add_argument(
-        "--checkpoint-dir",
-        default="checkpoints",
-        help="Directory for periodic checkpoint files.",
-    )
-    parser.add_argument(
-        "--launch-browser",
-        action="store_true",
-        help=(
-            "Let Playwright launch a Chromium browser automatically. "
-            "When omitted, connect to Chrome via CDP for --num-envs=1; "
-            "for --num-envs>1 managed mode is auto-enabled."
-        ),
-    )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run the browser without a visible window (only used with --launch-browser).",
-    )
-    parser.add_argument(
-        "--shared-browser-tabs",
-        action="store_true",
-        help=(
-            "Use one shared browser with multiple tabs for --num-envs>1. "
-            "Default behavior is one browser per env in subprocess parallel mode."
-        ),
-    )
-    parser.add_argument(
-        "--num-envs",
-        type=int,
-        default=5,
-        help=(
-            "Number of simulator environments to run in parallel. "
-            "When >1, managed mode is enabled automatically."
-        ),
-    )
+    parser.add_argument("--model-path", default="models/ppo_docking", help="Path to save/load the model.")
+    parser.add_argument("--timesteps", type=int, default=5_000_000, help="Total training timesteps.")
+    parser.add_argument("--resume", action="store_true", help="Resume training.")
+    parser.add_argument("--checkpoint-freq", type=int, default=50_000, help="Checkpoint frequency in steps.")
+    parser.add_argument("--checkpoint-dir", default="checkpoints", help="Directory for checkpoints.")
+    parser.add_argument("--num-envs", type=int, default=16, help="Number of vectorized fast envs.")
     args = parser.parse_args()
 
     train(
@@ -334,9 +251,6 @@ def main() -> None:
         resume=args.resume,
         checkpoint_freq=args.checkpoint_freq,
         checkpoint_dir=args.checkpoint_dir,
-        launch_browser=args.launch_browser,
-        headless=args.headless,
-        shared_browser_tabs=args.shared_browser_tabs,
         num_envs=args.num_envs,
     )
 
