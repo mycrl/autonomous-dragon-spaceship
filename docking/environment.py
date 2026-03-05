@@ -41,7 +41,7 @@ class IssDockingEnv(gym.Env):
 
     SUCCESS_THRESHOLD: float = 0.2
     MAX_RANGE: float = 350.0   # metres
-    MAX_ATTITUDE: float = 80.0   # degrees
+    MAX_ATTITUDE: float = 30.0   # degrees
     MAX_SAFE_RATE: float = 0.2   # m/s
     NEAR_DISTANCE: float = 5.0   # metres
     ATTITUDE_KEYS: tuple[str, ...] = ("roll", "yaw", "pitch")

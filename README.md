@@ -38,7 +38,7 @@ This MultiDiscrete setup enables the agent to issue simultaneous thrust instruct
 **Episode termination conditions**
 
 - ✅ **Success** — all readings are within ±0.2
-- 🧭 **Attitude limit** — `|roll|` or `|yaw|` or `|pitch|` > 80°
+- 🧭 **Attitude limit** — `|roll|` or `|yaw|` or `|pitch|` > 30°
 - 🚫 **Out of range** — range > 350 m
 - ⏱ **Timeout** — 3 000 steps elapsed
 
