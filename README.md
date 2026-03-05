@@ -1,4 +1,4 @@
-# Autonomous ISS
+# Autonomous Dragon Spaceship
 
 A Dragon spacecraft ISS docking autonomous driving system built with a custom
 [Gymnasium](https://gymnasium.farama.org/) environment and trained with
