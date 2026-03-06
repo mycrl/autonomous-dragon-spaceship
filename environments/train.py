@@ -283,9 +283,10 @@ class TrainIssDockingEnv(gym.Env):
         self.state_vars["y"] += self.state_vars["vy"] * self.dt
         self.state_vars["z"] += self.state_vars["vz"] * self.dt
         
-        # In the browser simulator UI, displayed attitude angle changes opposite
-        # to displayed angular-rate sign for all rotational axes.
-        self.state_vars["roll"] -= self.state_vars["roll_rate"] * self.dt
+        # Axis convention in the real simulator is asymmetric:
+        # - roll angle follows roll_rate sign directly
+        # - pitch/yaw angles change opposite to their displayed rates.
+        self.state_vars["roll"] += self.state_vars["roll_rate"] * self.dt
         self.state_vars["pitch"] -= self.state_vars["pitch_rate"] * self.dt
         self.state_vars["yaw"] -= self.state_vars["yaw_rate"] * self.dt
 
@@ -433,13 +434,13 @@ class TrainIssDockingEnv(gym.Env):
 
         # c) Angular-rate target-band shaping (per-axis, no global coupling).
         axis_to_rate = {
-            "roll": "roll_rate",
-            "pitch": "pitch_rate",
-            "yaw": "yaw_rate",
+            "roll": ("roll_rate", -0.02),
+            "pitch": ("pitch_rate", 0.02),
+            "yaw": ("yaw_rate", 0.02),
         }
-        for axis, rate_key in axis_to_rate.items():
-            target_rate = float(np.clip(abs(state[axis]) * 0.02, 0.0, self.GOOD_ANG_RATE_THRESHOLD))
-            delta = abs(abs(state[rate_key]) - target_rate)
+        for axis, (rate_key, gain) in axis_to_rate.items():
+            target_rate = float(np.clip(state[axis] * gain, -self.GOOD_ANG_RATE_THRESHOLD, self.GOOD_ANG_RATE_THRESHOLD))
+            delta = abs(state[rate_key] - target_rate)
             self._add_reward_component(reward_components, f"angular_target_{axis}", -delta * 0.8)
 
         # Keep hard punishment only for clearly unsafe spin rates.
