@@ -115,7 +115,7 @@ Metric weights used in progress scoring:
 
 Definitions:
 
-- $\operatorname{clip}(x,a,b)=\min(\max(x,a),b)$
+- $\mathrm{clip}(x,a,b)=\min(\max(x,a),b)$
 - $\mathbb{I}(\cdot)$ is the indicator function, equal to $1$ when true and $0$ otherwise
 - $A$ is the set of active control dimensions in the current step, and $|A|$ its size
 - $\Delta_{d,m}$ is the improvement of metric $m$ on dimension $d$
@@ -132,7 +132,7 @@ R_{\text{action}} = -0.03\,|A| - 0.12\,N_{\text{quick\_repeat}} - 0.16\,N_{\text
 $$
 
 $$
-R_{\text{progress}} = \sum_{d}\sum_{m\in\text{mapped}(d)} \mathbb{I}(\text{active}_d)\, s_d\,\operatorname{clip}(\Delta_{d,m}w_m,-0.8,0.8) + R_{\text{repeat}} + R_{\text{ineff}}
+R_{\text{progress}} = \sum_{d}\sum_{m\in\text{mapped}(d)} \mathbb{I}(\text{active}_d)\, s_d\,\mathrm{clip}(\Delta_{d,m}w_m,-0.8,0.8) + R_{\text{repeat}} + R_{\text{ineff}}
 $$
 
 Here, $s_d=0.35$ for translation dimensions and $s_d=1.0$ for rotation dimensions.
@@ -141,9 +141,9 @@ and $R_{\text{ineff}}$ is the ineffective-rotation penalty ($-0.06$).
 
 $$
 R_{\text{noop}} = \sum_{d}\sum_{m\in\text{mapped}(d)} \mathbb{I}(\neg\text{active}_d)\left[
-\operatorname{clip}(0.5\Delta_{d,m},0,0.25)
-+ \mathbb{I}(\text{observe\_window}_d)\operatorname{clip}(0.8\Delta_{d,m},0,0.2)
-- \operatorname{clip}(0.35(\text{violation}_{d,m}-\Delta_{d,m}),0,0.25)
+\mathrm{clip}(0.5\Delta_{d,m},0,0.25)
+ + \mathbb{I}(\text{observe\_window}_d)\mathrm{clip}(0.8\Delta_{d,m},0,0.2)
+ - \mathrm{clip}(0.35(\text{violation}_{d,m}-\Delta_{d,m}),0,0.25)
 \right]
 $$
 
@@ -162,9 +162,9 @@ $$
 
 $$
 \begin{aligned}
-r^*_{roll} &= \operatorname{clip}(-0.02\,roll,-0.25,0.25),\\
-r^*_{pitch} &= \operatorname{clip}(0.02\,pitch,-0.25,0.25),\\
-r^*_{yaw} &= \operatorname{clip}(0.02\,yaw,-0.25,0.25)
+r^*_{roll} &= \mathrm{clip}(-0.02\\,roll,-0.25,0.25),\\
+r^*_{pitch} &= \mathrm{clip}(0.02\\,pitch,-0.25,0.25),\\
+r^*_{yaw} &= \mathrm{clip}(0.02\\,yaw,-0.25,0.25)
 \end{aligned}
 $$
 
