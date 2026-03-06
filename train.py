@@ -3,7 +3,7 @@ Training script for the SpaceX ISS Docking Simulator (Fast Version).
 
 Uses Proximal Policy Optimization (PPO) from Stable-Baselines3 to train an agent.
 To maximise performance, this script exclusively uses the purely Python-based
-FastIssDockingEnv, achieving thousands of steps per second.
+TrainIssDockingEnv, achieving thousands of steps per second.
 """
 
 import argparse
@@ -15,6 +15,7 @@ from typing import Callable, Any
 
 import gymnasium as gym
 from stable_baselines3 import PPO
+from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -22,13 +23,13 @@ from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.vec_env import VecMonitor
 from stable_baselines3.common.vec_env import VecNormalize
 
-from docking import FastIssDockingEnv
+from environments import TrainIssDockingEnv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def _safe_save_model(model: PPO, path: str, reason: str, max_retries: int = 2) -> str | None:
+def _safe_save_model(model: BaseAlgorithm, path: str, reason: str, max_retries: int = 2) -> str | None:
     """Save model robustly against transient filesystem errors on Windows."""
     dir_path = os.path.dirname(path)
     if dir_path:
@@ -128,7 +129,7 @@ class SafeCheckpointCallback(BaseCallback):
 
 def _make_env() -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
-        return FastIssDockingEnv()
+        return TrainIssDockingEnv()
     return _init
 
 
@@ -181,12 +182,12 @@ def train(
             policy="MlpPolicy",
             env=env,
             verbose=1,
-            learning_rate=3e-4,
-            n_steps=1024,
-            batch_size=256,
-            gamma=0.99,
-            gae_lambda=0.95,
-            ent_coef=0.01,
+            learning_rate=2e-4,
+            n_steps=2048,
+            batch_size=512,
+            gamma=0.995,
+            gae_lambda=0.98,
+            ent_coef=0.002,
             tensorboard_log=_get_tensorboard_log_dir(),
         )
 
@@ -203,7 +204,7 @@ def train(
     def _save_progress(reason: str) -> None:
         saved_model_path = _safe_save_model(model, model_path, f"final-{reason}")
         if saved_model_path is not None:
-            env.save(saved_model_path + "_vec_normalize.pkl")
+            env.save(saved_model_path + "_vec_normalize.pkl") # type: ignore
             logger.info(
                 "Progress saved (%s) to '%s.zip' and stats to '%s_vec_normalize.pkl'",
                 reason,

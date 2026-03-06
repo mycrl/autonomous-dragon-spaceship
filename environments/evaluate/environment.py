@@ -8,7 +8,6 @@ observation space and MultiDiscrete action space.
 
 import logging
 import time
-from typing import Any
 
 import numpy as np
 import gymnasium as gym
@@ -19,12 +18,15 @@ from .browser import SimulatorBrowser
 logger = logging.getLogger(__name__)
 
 
-class IssDockingEnv(gym.Env):
+class EvalIssDockingEnv(gym.Env):
     """
     Gymnasium environment that wraps the SpaceX ISS Docking Simulator.
     """
 
     metadata = {"render_modes": []}
+
+    INITIAL_FUEL: float = 800.0
+    FUEL_PER_BUTTON: float = 1.0
 
     OBS_KEYS: list[str] = [
         "x", "y", "z",
@@ -33,13 +35,18 @@ class IssDockingEnv(gym.Env):
         "yaw", "yaw_rate",
         "rate",
         "pitch", "pitch_rate",
+        "fuel",
     ]
     OBS_HIGH: np.ndarray = np.array(
-        [300.0, 300.0, 300.0, 180.0, 10.0, 500.0, 180.0, 10.0, 5.0, 180.0, 10.0],
+        [300.0, 300.0, 300.0, 180.0, 10.0, 500.0, 180.0, 10.0, 5.0, 180.0, 10.0, 1.0],
         dtype=np.float32,
     )
 
     SUCCESS_THRESHOLD: float = 0.2
+    GOOD_POS_THRESHOLD: float = 0.2
+    GOOD_ATTITUDE_THRESHOLD: float = 0.2
+    GOOD_ANG_RATE_THRESHOLD: float = 0.25
+    GOOD_RANGE_THRESHOLD: float = 2.0
     MAX_RANGE: float = 350.0   # metres
     MAX_ATTITUDE: float = 30.0   # degrees
     MAX_SAFE_RATE: float = 0.2   # m/s
@@ -55,7 +62,7 @@ class IssDockingEnv(gym.Env):
         expected_shared_tabs: int | None = None,
         step_delay: float = 0.5,
         reset_wait: float = 3.0,
-        max_steps: int = 3000,
+        max_steps: int | None = None,
         render_mode=None,
         **kwargs
     ) -> None:
@@ -84,6 +91,7 @@ class IssDockingEnv(gym.Env):
 
         self._steps: int = 0
         self.fuel_used: int = 0
+        self.fuel_remaining: float = self.INITIAL_FUEL
         self._prev_state = {}
 
         self._action_map = {
@@ -95,22 +103,12 @@ class IssDockingEnv(gym.Env):
             5: {1: "yaw_right", 2: "yaw_left"},
         }
 
-        # Maps dimension to state keys for targeted reward shaping:
-        # Tuple of (position_error_key, rate_error_key)
-        self._dim_to_state_keys = {
-            0: ("range", "rate"), # Forward/backward affects range/rate
-            1: ("y", None),
-            2: ("x", None),
-            3: ("roll", "roll_rate"),
-            4: ("pitch", "pitch_rate"),
-            5: ("yaw", "yaw_rate"),
-        }
-
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self._browser.reset(wait=self.reset_wait)
         self._steps = 0
         self.fuel_used = 0
+        self.fuel_remaining = self.INITIAL_FUEL
         
         obs = self._get_obs()
         self._prev_state = self._obs_to_dict(obs)
@@ -118,92 +116,44 @@ class IssDockingEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         button_presses = 0
-        active_dims = set()
-        
         for dim, act_val in enumerate(action):
             act_val = int(act_val)
             if act_val in (1, 2):
                 btn = self._action_map[dim][act_val]
                 self._browser.click_action(btn)
                 button_presses += 1
-                active_dims.add(dim)
 
         if button_presses > 0:
-            self.fuel_used += button_presses
+            fuel_spent = button_presses * self.FUEL_PER_BUTTON
+            self.fuel_used += int(fuel_spent)
+            self.fuel_remaining = max(0.0, self.fuel_remaining - fuel_spent)
 
         time.sleep(self.step_delay)
         self._steps += 1
 
         obs = self._get_obs()
         state = self._obs_to_dict(obs)
-
-        # =========================================================
-        # REWARD COMPUTATION
-        # =========================================================
+        # Evaluation-only environment: no reward shaping.
         reward = 0.0
 
-        # 1. Action/Fuel penalty
-        reward -= 0.01 * button_presses
-
-        # 2. General Improvements (Global Dense Reward)
-        # Keeps AI on track even when coasting (NO_OP)
-        range_diff = self._prev_state["range"] - state["range"]
-        reward += range_diff * 1.5
-
-        prev_attitude_error = sum(abs(self._prev_state[k]) for k in self.ATTITUDE_KEYS)
-        curr_attitude_error = sum(abs(state[k]) for k in self.ATTITUDE_KEYS)
-        reward += (prev_attitude_error - curr_attitude_error) * 2.0
-
-        prev_pos_error = abs(self._prev_state["x"]) + abs(self._prev_state["y"]) + abs(self._prev_state["z"])
-        curr_pos_error = abs(state["x"]) + abs(state["y"]) + abs(state["z"])
-        reward += (prev_pos_error - curr_pos_error) * 1.5
-
-        # 3. Targeted Branch Rewards (Credit Assignment)
-        # If the agent took an action on a specific axis, give a sharp scalar bonus/penalty 
-        # strictly based on whether that specific axis error improved. This helps PPO map
-        # the global scalar reward variance directly to the action component taken.
-        for dim in active_dims:
-            pos_key, _ = self._dim_to_state_keys[dim]
-            if pos_key:
-                improvement = abs(self._prev_state[pos_key]) - abs(state[pos_key])
-                reward += improvement * 5.0  # High targeted multiplier!
-
-        # 4. Safety Constraints & Violations (Extreme Penalties)
-        # a) Overspeed when closing in
+        # Terminal Conditions
         current_range = state["range"]
-        if current_range < self.NEAR_DISTANCE and state["rate"] < -self.MAX_SAFE_RATE:
-            reward -= 10.0
-
-        # b) Stagnation when far away
-        if current_range > 15.0 and abs(state["rate"]) < 0.01:
-            reward -= 0.1
-
-        # c) EXTREME Angular Rate Penalty (Strict limit around 0.2 deg/s)
-        # If any rotation rate exceeds 0.2, apply a geometrically increasing penalty.
-        for key in ("roll_rate", "yaw_rate", "pitch_rate"):
-            rate_val = abs(state[key])
-            if rate_val > 0.2:
-                # E.g., rate=0.8 -> excess=0.6 -> (0.6 * 10)^2 = 36.0 penalty
-                # Ensures mild drifting is forgiven, but erratic spinning is killed.
-                excess = rate_val - 0.2
-                reward -= (excess * 10.0) ** 2  
-
-        # 5. Terminal Conditions
         terminated = False
         truncated = False
         success = False
 
         if self._is_docked(state):
-            reward += 1000.0
             terminated = True
             success = True
+        elif self.fuel_remaining <= 0.0:
+            terminated = True
+        elif state["rate"] > 0.8:
+            terminated = True
         elif current_range > self.MAX_RANGE:
-            reward -= 1000.0
             terminated = True
         elif any(abs(state[k]) > self.MAX_ATTITUDE for k in self.ATTITUDE_KEYS):
-            reward -= 1000.0
             terminated = True
-        elif self._steps >= self.max_steps:
+        elif self.max_steps is not None and self._steps >= self.max_steps:
             truncated = True
 
         self._prev_state = state
@@ -213,6 +163,7 @@ class IssDockingEnv(gym.Env):
             "fuel_used": int(self.fuel_used),
             "success": success,
             "button_presses": int(button_presses),
+            "fuel_remaining": float(self.fuel_remaining),
             **state,
         }
 
@@ -223,7 +174,11 @@ class IssDockingEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         raw = self._browser.read_state()
-        obs = np.array([raw[k] for k in self.OBS_KEYS], dtype=np.float32)
+                    
+        obs = np.array(
+            [raw[k] for k in self.OBS_KEYS if k != "fuel"] + [self.fuel_remaining / self.INITIAL_FUEL],
+            dtype=np.float32,
+        )
         return np.clip(obs, -self.OBS_HIGH, self.OBS_HIGH)
 
     def _obs_to_dict(self, obs: np.ndarray) -> dict[str, float]:
@@ -231,5 +186,17 @@ class IssDockingEnv(gym.Env):
 
     @staticmethod
     def _is_docked(state: dict[str, float]) -> bool:
-        return all(abs(v) <= IssDockingEnv.SUCCESS_THRESHOLD for v in state.values())
+        return (
+            abs(state["x"]) <= EvalIssDockingEnv.GOOD_POS_THRESHOLD
+            and abs(state["y"]) <= EvalIssDockingEnv.GOOD_POS_THRESHOLD
+            and abs(state["z"]) <= EvalIssDockingEnv.GOOD_POS_THRESHOLD
+            and abs(state["roll"]) <= EvalIssDockingEnv.GOOD_ATTITUDE_THRESHOLD
+            and abs(state["pitch"]) <= EvalIssDockingEnv.GOOD_ATTITUDE_THRESHOLD
+            and abs(state["yaw"]) <= EvalIssDockingEnv.GOOD_ATTITUDE_THRESHOLD
+            and abs(state["roll_rate"]) <= EvalIssDockingEnv.GOOD_ANG_RATE_THRESHOLD
+            and abs(state["pitch_rate"]) <= EvalIssDockingEnv.GOOD_ANG_RATE_THRESHOLD
+            and abs(state["yaw_rate"]) <= EvalIssDockingEnv.GOOD_ANG_RATE_THRESHOLD
+            and 0.0 <= state["rate"] <= EvalIssDockingEnv.MAX_SAFE_RATE
+            and state["range"] < EvalIssDockingEnv.GOOD_RANGE_THRESHOLD
+        )
 

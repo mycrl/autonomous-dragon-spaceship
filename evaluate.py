@@ -12,7 +12,7 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from docking import IssDockingEnv
+from environments import EvalIssDockingEnv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ def evaluate(
     launch_browser: bool,
     headless: bool,
 ) -> None:
-    env = IssDockingEnv(launch_browser=launch_browser, headless=headless)
+    env = EvalIssDockingEnv(launch_browser=launch_browser, headless=headless)
     stats_path = model_path + "_vec_normalize.pkl"
     vec_env = VecNormalize.load(stats_path, DummyVecEnv([lambda: env]))
     vec_env.training = False
@@ -32,32 +32,37 @@ def evaluate(
 
     model = PPO.load(model_path, env=vec_env)
 
-    episode_rewards: list[float] = []
+    final_ranges: list[float] = []
+    final_rates: list[float] = []
+    episode_steps: list[int] = []
+    episode_fuel_used: list[int] = []
     successes = 0
 
     for episode in range(n_episodes):
         obs = vec_env.reset()
         done = False
-        total_reward = 0.0
         info = {}
 
         while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, rewards, dones, infos = vec_env.step(action)
-            total_reward += rewards[0]
+            action, _ = model.predict(obs, deterministic=True) # pyright: ignore[reportArgumentType]
+            obs, _rewards, dones, infos = vec_env.step(action)
             done = dones[0]
             info = infos[0]
 
-        episode_rewards.append(total_reward)
+        final_ranges.append(float(info.get("range", 0.0)))
+        final_rates.append(float(info.get("rate", 0.0)))
+        episode_steps.append(int(info.get("steps", 0)))
+        episode_fuel_used.append(int(info.get("fuel_used", 0)))
         if info.get("success", False):
             successes += 1
 
         print(
             f"Episode {episode + 1:3d}/{n_episodes}: "
-            f"reward={total_reward:8.2f}  "
+            f"success={bool(info.get('success', False))!s:5s}  "
             f"range={info.get('range', 0.0):.2f} m  "
             f"rate={info.get('rate', 0.0):.3f} m/s  "
-            f"steps={info.get('steps', 0)}"
+            f"steps={info.get('steps', 0):4d}  "
+            f"fuel_used={info.get('fuel_used', 0):4d}"
         )
 
     vec_env.close()
@@ -65,7 +70,10 @@ def evaluate(
     print("\n--- Evaluation Summary ---")
     print(f"Episodes     : {n_episodes}")
     print(f"Success rate : {successes / n_episodes * 100:.1f}%")
-    print(f"Mean reward  : {np.mean(episode_rewards):.2f}")
+    print(f"Mean range   : {np.mean(final_ranges):.2f} m")
+    print(f"Mean rate    : {np.mean(final_rates):.3f} m/s")
+    print(f"Mean steps   : {np.mean(episode_steps):.1f}")
+    print(f"Mean fuel    : {np.mean(episode_fuel_used):.1f}")
 
 
 def main() -> None:
