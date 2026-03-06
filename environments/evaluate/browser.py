@@ -46,13 +46,365 @@ from playwright.sync_api import (
     BrowserContext,
     Page,
     Playwright,
+    TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
 )
 
-from .browser_shared import SharedLaunchCoordinator
-from .browser_startup import BrowserStartupCoordinator
-
 logger = logging.getLogger(__name__)
+
+
+class SharedLaunchCoordinator:
+    """Helpers for one-browser multi-tab managed launch mode."""
+
+    @staticmethod
+    def connect_shared_launch(browser) -> None:
+        """Connect using a single shared browser and one tab per env."""
+        cls = type(browser)
+        if cls._shared_browser is None:
+            shared_playwright = sync_playwright().start()
+            shared_browser = shared_playwright.chromium.launch(
+                headless=browser._headless,
+                args=browser.BROWSER_LAUNCH_ARGS,
+            )
+            shared_context = shared_browser.new_context(no_viewport=True)
+            cls._shared_playwright = shared_playwright
+            cls._shared_browser = shared_browser
+            cls._shared_context = shared_context
+            cls._shared_ref_count = 0
+            cls._shared_instances = []
+            cls._shared_tabs_prepared = False
+            cls._shared_expected_tabs = browser._expected_shared_tabs
+        else:
+            cls._shared_expected_tabs = max(
+                cls._shared_expected_tabs,
+                browser._expected_shared_tabs,
+            )
+
+        assert cls._shared_context is not None
+        browser._playwright = cls._shared_playwright
+        browser._browser = cls._shared_browser
+        browser._context = cls._shared_context
+        browser._page = browser._context.new_page()
+
+        browser._page.goto(
+            browser.SIMULATOR_URL,
+            wait_until="domcontentloaded",
+            timeout=int(browser._page_load_timeout * 1_000),
+        )
+        browser._skip_next_reset_reload = True
+        cls._shared_instances.append(browser)
+
+        cls._shared_ref_count += 1
+        logger.info(
+            "Attached shared browser tab (%d/%d).",
+            cls._shared_ref_count,
+            cls._shared_expected_tabs,
+        )
+
+        if (
+            not cls._shared_tabs_prepared
+            and len(cls._shared_instances) >= cls._shared_expected_tabs
+        ):
+            browser._prepare_all_shared_tabs_before_training()
+
+    @staticmethod
+    def disconnect_shared_launch(browser) -> None:
+        """Close only this tab; close shared browser when last tab exits."""
+        cls = type(browser)
+
+        if browser in cls._shared_instances:
+            cls._shared_instances.remove(browser)
+
+        if browser._page is not None:
+            try:
+                browser._page.close()
+            except Exception:
+                pass
+
+        browser._page = None
+        browser._context = None
+        browser._browser = None
+        browser._playwright = None
+
+        cls._shared_ref_count = max(0, cls._shared_ref_count - 1)
+        if cls._shared_ref_count > 0:
+            return
+
+        if cls._shared_browser is not None:
+            try:
+                cls._shared_browser.close()
+            except Exception:
+                pass
+        if cls._shared_playwright is not None:
+            try:
+                cls._shared_playwright.stop()
+            except Exception:
+                pass
+
+        cls._shared_context = None
+        cls._shared_browser = None
+        cls._shared_playwright = None
+        cls._shared_instances = []
+        cls._shared_tabs_prepared = False
+        cls._shared_expected_tabs = 0
+
+
+class BrowserStartupCoordinator:
+    """Stateless startup helpers that operate on a SimulatorBrowser instance."""
+
+    @staticmethod
+    def read_preloader_percent(
+        browser,
+        page: Page,
+        timeout_ms: int = 1000,
+    ) -> tuple[int | None, str]:
+        """Return parsed percent and raw text from #preloader-percent."""
+        try:
+            raw = page.locator(browser.PRELOADER_PERCENT_SELECTOR).first.text_content(
+                timeout=timeout_ms
+            )
+        except PlaywrightTimeoutError:
+            return None, ""
+        except Exception:
+            return None, ""
+
+        text = (raw or "").strip()
+        match = re.search(r"\d{1,3}(?:\.\d+)?", text)
+        if not match:
+            return None, text
+
+        try:
+            return int(float(match.group(0))), text
+        except ValueError:
+            return None, text
+
+    @staticmethod
+    def wait_for_begin_button_ready(browser, page: Page, timeout_seconds: float) -> None:
+        """Wait until begin button is visible/clickable in the DOM."""
+        deadline = time.time() + max(1.0, timeout_seconds)
+        last_error: str = ""
+
+        while time.time() < deadline:
+            try:
+                locator = page.locator(browser.BEGIN_BUTTON_SELECTOR).first
+                if locator.is_visible(timeout=200):
+                    return
+            except Exception as exc:
+                last_error = str(exc)
+
+            time.sleep(browser.BEGIN_CLICK_RETRY_INTERVAL_SECONDS)
+
+        raise RuntimeError(
+            "Timed out waiting for begin button readiness: "
+            f"selector={browser.BEGIN_BUTTON_SELECTOR}, last_error='{last_error}'"
+        )
+
+    @staticmethod
+    def click_begin_button_with_retries(browser, page: Page, timeout_seconds: float) -> None:
+        """Click begin with retries and JS fallback for transient click failures."""
+        deadline = time.time() + max(1.0, timeout_seconds)
+        last_error: str = ""
+
+        while time.time() < deadline:
+            try:
+                page.click(
+                    browser.BEGIN_BUTTON_SELECTOR,
+                    timeout=1000,
+                    force=True,
+                )
+                logger.info("Clicked begin button: %s", browser.BEGIN_BUTTON_SELECTOR)
+                return
+            except Exception as exc:
+                last_error = str(exc)
+
+            try:
+                clicked = bool(
+                    page.evaluate(
+                        """
+                        (selector) => {
+                            const el = document.querySelector(selector);
+                            if (!el) {
+                                return false;
+                            }
+                            el.click();
+                            return true;
+                        }
+                        """,
+                        browser.BEGIN_BUTTON_SELECTOR,
+                    )
+                )
+                if clicked:
+                    logger.info("Clicked begin button via JS: %s", browser.BEGIN_BUTTON_SELECTOR)
+                    return
+            except Exception as exc:
+                last_error = str(exc)
+
+            time.sleep(browser.BEGIN_CLICK_RETRY_INTERVAL_SECONDS)
+
+        raise RuntimeError(
+            "Timed out clicking begin button: "
+            f"selector={browser.BEGIN_BUTTON_SELECTOR}, last_error='{last_error}'"
+        )
+
+    @staticmethod
+    def prepare_all_shared_tabs_before_training(browser) -> None:
+        """Run fixed startup flow for all shared tabs and block until all are ready."""
+        cls = type(browser)
+        if cls._shared_tabs_prepared:
+            return
+
+        instances = [inst for inst in cls._shared_instances if inst._page is not None]
+        if not instances:
+            raise RuntimeError("No shared tab instances available for startup.")
+
+        timeout_seconds = max(browser._page_load_timeout * 4, 600.0)
+        deadline = time.time() + timeout_seconds
+
+        state: dict[int, dict[str, float | str]] = {}
+        for inst in instances:
+            state[id(inst)] = {
+                "phase": "wait_preloader",
+                "preloader_ready_at": 0.0,
+                "begin_clicked_at": 0.0,
+            }
+
+        logger.info(
+            "Preparing %d shared tabs in parallel startup workflow ...",
+            len(instances),
+        )
+
+        while time.time() < deadline:
+            now = time.time()
+            all_done = True
+
+            for inst in instances:
+                if inst._page is None:
+                    continue
+
+                tab_state = state[id(inst)]
+                phase = str(tab_state["phase"])
+
+                if phase == "done":
+                    continue
+
+                all_done = False
+                page = inst._page
+
+                if phase == "wait_preloader":
+                    try:
+                        percent, _ = BrowserStartupCoordinator.read_preloader_percent(
+                            inst,
+                            page,
+                            timeout_ms=300,
+                        )
+                        if percent is not None and percent >= 100:
+                            tab_state["preloader_ready_at"] = now
+                            tab_state["phase"] = "wait_after_load"
+                    except PlaywrightTimeoutError:
+                        pass
+                    except Exception:
+                        pass
+                    continue
+
+                if phase == "wait_after_load":
+                    preloader_ready_at = float(tab_state["preloader_ready_at"])
+                    if (now - preloader_ready_at) >= browser.AFTER_LOAD_WAIT_SECONDS:
+                        try:
+                            BrowserStartupCoordinator.wait_for_begin_button_ready(
+                                inst,
+                                page,
+                                timeout_seconds=8.0,
+                            )
+                            BrowserStartupCoordinator.click_begin_button_with_retries(
+                                inst,
+                                page,
+                                timeout_seconds=8.0,
+                            )
+                            tab_state["begin_clicked_at"] = now
+                            tab_state["phase"] = "wait_after_begin"
+                        except Exception:
+                            pass
+                    continue
+
+                if phase == "wait_after_begin":
+                    begin_clicked_at = float(tab_state["begin_clicked_at"])
+                    if (now - begin_clicked_at) >= browser.AFTER_BEGIN_WAIT_SECONDS:
+                        tab_state["phase"] = "done"
+                        inst._startup_completed = True
+                        inst._skip_next_reset_reload = True
+                    continue
+
+            if all_done:
+                cls._shared_tabs_prepared = True
+                logger.info("All shared tabs are ready; starting parallel training.")
+                return
+
+            time.sleep(browser.PRELOADER_POLL_INTERVAL_SECONDS)
+
+        raise RuntimeError(
+            "Timed out while preparing shared tabs for startup. "
+            f"expected={cls._shared_expected_tabs}, connected={len(instances)}"
+        )
+
+    @staticmethod
+    def wait_for_preloader_complete(browser, timeout_seconds: float) -> None:
+        """Wait until #preloader-percent reaches 100."""
+        browser._require_page()
+        page = browser._page
+        assert page is not None
+
+        deadline = time.time() + timeout_seconds
+        last_seen: str = ""
+
+        while time.time() < deadline:
+            try:
+                percent, text = BrowserStartupCoordinator.read_preloader_percent(
+                    browser,
+                    page,
+                    timeout_ms=1000,
+                )
+                if text:
+                    last_seen = text
+                if percent is not None and percent >= 100:
+                    logger.info("Preloader reached 100%% (%s).", last_seen or text)
+                    return
+            except PlaywrightTimeoutError:
+                pass
+            except Exception:
+                pass
+
+            time.sleep(browser.PRELOADER_POLL_INTERVAL_SECONDS)
+
+        raise RuntimeError(
+            "Timed out waiting for preloader completion: "
+            f"selector={browser.PRELOADER_PERCENT_SELECTOR}, last_seen='{last_seen}'"
+        )
+
+    @staticmethod
+    def auto_start_simulator_if_needed(browser) -> None:
+        """Run deterministic managed-mode startup sequence."""
+        browser._require_page()
+        page = browser._page
+        assert page is not None
+
+        BrowserStartupCoordinator.wait_for_preloader_complete(
+            browser,
+            timeout_seconds=max(browser._page_load_timeout * 4, 600.0),
+        )
+
+        time.sleep(browser.AFTER_LOAD_WAIT_SECONDS)
+        BrowserStartupCoordinator.wait_for_begin_button_ready(
+            browser,
+            page,
+            timeout_seconds=max(browser._page_load_timeout, 10.0),
+        )
+        BrowserStartupCoordinator.click_begin_button_with_retries(
+            browser,
+            page,
+            timeout_seconds=max(browser._page_load_timeout, 10.0),
+        )
+
+        time.sleep(browser.AFTER_BEGIN_WAIT_SECONDS)
 
 
 class SimulatorBrowser:
@@ -370,9 +722,15 @@ class SimulatorBrowser:
             text = page.inner_text(selector).strip()
             # The DOM includes units (e.g. "200.0 m", "15.0°", "0.039 m/s").
             # Extract just the leading numeric token (with optional sign).
-            match = re.search(r"-?\d+\.?\d*", text)
+            # SpaceX UI uses a typographic minus sign (U+2212) instead of a standard hyphen!
+            match = re.search(r"[-−]?\d+\.?\d*", text)
             try:
-                state[key] = float(match.group()) if match else 0.0
+                if match:
+                    # Convert typographical minus to standard hyphen so float() doesn't fail
+                    val_str = match.group().replace('−', '-')
+                    state[key] = float(val_str)
+                else:
+                    state[key] = 0.0
             except (ValueError, AttributeError):
                 logger.warning(
                     "Could not parse '%s' for state key '%s'; defaulting to 0.0",
