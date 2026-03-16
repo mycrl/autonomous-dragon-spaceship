@@ -41,7 +41,7 @@ This allows simultaneous multi-axis commands in one step.
 
 ## Termination Rules
 
-Common thresholds used by both environments:
+Docking success condition (used by both environments):
 
 - Success (`_is_docked`):
 	- `|x|,|y|,|z| <= 0.2`
@@ -49,13 +49,16 @@ Common thresholds used by both environments:
 	- `|roll_rate|,|pitch_rate|,|yaw_rate| <= 0.25`
 	- `-0.25 <= rate <= -0.1` (negative means closing)
 	- `range < 2.0`
-- Failure:
+Training environment failures (`TrainIssDockingEnv`):
 	- fuel exhausted
-	- `|rate| > 0.8`
+	- `|y| > 35` or `|z| > 35`
 	- `range > 350`
 	- any of `|roll|,|pitch|,|yaw| > 30`
-- Truncation:
-	- if `max_steps` is set and reached
+
+Evaluation environment (`EvalIssDockingEnv`):
+	- no failure termination checks
+	- episode only ends on successful docking
+	- if `max_steps` is set and reached, episode is truncated
 
 ## Reward (Training Environment)
 

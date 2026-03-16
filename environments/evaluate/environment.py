@@ -51,6 +51,7 @@ class EvalIssDockingEnv(gym.Env):
     MAX_ATTITUDE: float = 30.0   # degrees
     MAX_SAFE_RATE: float = 0.2   # m/s
     NEAR_DISTANCE: float = 5.0   # metres
+    LATERAL_FAIL_LIMIT: float = 35.0
     ATTITUDE_KEYS: tuple[str, ...] = ("roll", "yaw", "pitch")
     ACTION_MAP: dict[int, dict[int, str]] = {
         0: {1: "translate_forward", 2: "translate_backward"},
@@ -149,14 +150,6 @@ class EvalIssDockingEnv(gym.Env):
         if self._is_docked(state):
             terminated = True
             success = True
-        elif self.fuel_remaining <= 0.0:
-            terminated = True
-        elif abs(state["rate"]) > 0.8:
-            terminated = True
-        elif current_range > self.MAX_RANGE:
-            terminated = True
-        elif any(abs(state[k]) > self.MAX_ATTITUDE for k in self.ATTITUDE_KEYS):
-            terminated = True
         elif self.max_steps is not None and self._steps >= self.max_steps:
             truncated = True
 
